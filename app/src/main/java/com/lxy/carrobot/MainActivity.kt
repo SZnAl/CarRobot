@@ -330,37 +330,68 @@ private fun rememberRobotState(): RobotState {
         val linearSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
         val gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
+        // 转弯相关变量
         var currentRotation = RotationDirection.NONE
+        // 转弯信心积分 (-30 ~ 30): 负数代表右转信心，正数代表左转信心
+        var rotationConfidence = 0
+        // 0.12 rad/s (约 7度/秒)，检测汽车的正常转弯
+        val rotationThreshold = 0.1f
+        // 触发门槛 需要积累多少信心才改变状态 (防抖动)
+        val rotationTriggerLimit = 5
 
+        // 前进相关变量
         var isMovingForward = false
-        // 记录最后一次检测到加速度的时间 (用于 Keep-Alive)
         var lastMoveTimestamp = 0L
-        // 记录第一次开始运动的时间 (用于启动延迟检测)
         var firstMoveTimestamp = 0L
 
-        // 设置参数
-        val forwardKeepAlive = 1500L // 停止运动后保持 1.5秒 (防闪烁)
-        val startDelay = 6000L       // 必须持续运动 6秒 后才显示前进表情 (防误触)
+        // 前进参数
+        val forwardKeepAlive = 1500L
+        val startDelay = 6000L
 
         val listener = object : SensorEventListener {
             override fun onSensorChanged(event: SensorEvent) {
                 val now = System.currentTimeMillis()
 
                 if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
-                    // 陀螺仪检测
+                    // 陀螺仪逻辑优化
                     val x = event.values[0]
                     val y = event.values[1]
-                    val rotationThreshold = 0.6f
 
+                    // 判断瞬时旋转方向
+                    var instantDir = 0 // 0:无, 1:左, -1:右
+
+                    // 检测逻辑：检查 Y 轴或 X 轴是否超过低阈值
+                    if (y > rotationThreshold || x < -rotationThreshold) {
+                        instantDir = 1 // 瞬间向左趋势
+                    } else if (y < -rotationThreshold || x > rotationThreshold) {
+                        instantDir = -1 // 瞬间向右趋势
+                    }
+
+                    // 信心积分逻辑 滤波
+                    if (instantDir == 1) {
+                        // 正在向左转，增加左转信心
+                        if (rotationConfidence < 20) rotationConfidence++
+                    } else if (instantDir == -1) {
+                        // 正在向右转，增加右转信心 (负数)
+                        if (rotationConfidence > -20) rotationConfidence--
+                    } else {
+                        // 没有明显旋转，信心归零 (衰减速度快一点，让停止转弯反应灵敏)
+                        if (rotationConfidence > 0) rotationConfidence -= 2
+                        if (rotationConfidence < 0) rotationConfidence += 2
+                    }
+
+                    // 归零修正
+                    if (rotationConfidence in -1..1 && instantDir == 0) rotationConfidence = 0
+
+                    // 根据信心值判定最终状态
                     currentRotation = when {
-                        y > rotationThreshold -> RotationDirection.LEFT
-                        y < -rotationThreshold -> RotationDirection.RIGHT
-                        x > rotationThreshold -> RotationDirection.RIGHT
-                        x < -rotationThreshold -> RotationDirection.LEFT
+                        rotationConfidence >= rotationTriggerLimit -> RotationDirection.RIGHT
+                        rotationConfidence <= -rotationTriggerLimit -> RotationDirection.LEFT
                         else -> RotationDirection.NONE
                     }
+
                 } else if (event.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION) {
-                    // 加速度检测
+                    // 加速度逻辑
                     val x = event.values[0]
                     val y = event.values[1]
                     val z = event.values[2]
@@ -368,32 +399,23 @@ private fun rememberRobotState(): RobotState {
                     val moveThreshold = 1.5f
 
                     if (magnitude > moveThreshold) {
-                        // 检测到有效运动
                         lastMoveTimestamp = now
-
-                        // 如果是刚开始动，记录起始时间
                         if (firstMoveTimestamp == 0L) {
                             firstMoveTimestamp = now
                         }
-
-                        // 只有持续时间超过 6 秒，才真正确认为前进状态
                         if (now - firstMoveTimestamp > startDelay) {
                             isMovingForward = true
                         }
                     } else {
-                        // 未检测到运动 (静止或匀速)
-
-                        // 检查 Keep-Alive (防止瞬时停止导致的闪烁)
                         if (now - lastMoveTimestamp > forwardKeepAlive) {
-                            // 停止
                             isMovingForward = false
-                            firstMoveTimestamp = 0L // 重置起始计时器
+                            firstMoveTimestamp = 0L
                         }
                     }
                 }
 
                 val finalMovement = if (currentRotation != RotationDirection.NONE) {
-                    // 检测到转弯，立即重置前进计时器和状态 保证转弯表情的优先级最高，且切换迅速
+                    // 如果检测到确实在转弯，立即打断前进判定
                     firstMoveTimestamp = 0L
                     isMovingForward = false
                     MovementDirection.NONE
